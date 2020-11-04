@@ -1,0 +1,6 @@
+train_file: str = '/Users/wujingwujing/PycharmProjects/name_entity_recongnization/data/task1_public/new_train.json'
+train_pickle_file: str = '/Users/wujingwujing/PycharmProjects/name_entity_recongnization/data/task1_public/new_train.json.pkl'
+val_file: str = '/Users/wujingwujing/PycharmProjects/name_entity_recongnization/data/task1_public/new_val.json'
+val_pickle_file: str = '/Users/wujingwujing/PycharmProjects/name_entity_recongnization/data/task1_public/new_val.json.pkl'
+label_file: str = '/Users/wujingwujing/PycharmProjects/name_entity_recongnization/data/task1_public/labels.txt'
+model_name: str = 'bert-base-uncased'
