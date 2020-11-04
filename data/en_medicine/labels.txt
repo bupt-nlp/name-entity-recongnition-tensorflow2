@@ -1,0 +1,17 @@
+O
+B-Drug
+I-Drug
+B-Disease
+I-Disease
+B-Gene
+I-Gene
+B-ChemicalCompound
+I-ChemicalCompound
+B-Virus
+I-Virus
+B-Chemical
+I-Chemical
+B-Phenotype
+I-Phenotype
+B-Organization
+I-Organization
