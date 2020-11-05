@@ -1,5 +1,7 @@
 from __future__ import absolute_import, division, print_function
 
+# refer: https://github.com/kamalkraj/BERT-NER-TF/blob/master/run_ner.py
+
 from typing import List
 import argparse
 import csv
@@ -14,6 +16,8 @@ import sys
 import numpy as np
 import tensorflow as tf
 from seqeval.metrics import classification_report
+
+from fastprogress import master_bar, progress_bar
 
 from bert_ner.model import BertNer
 from bert_ner.optimization import AdamWeightDecay, Warmup
@@ -132,7 +136,7 @@ def convert_examples_to_features(
         # 1. prepare the base data
         # this is for english language
         text_list = example.text_b.split(' ')
-        # TODO -> should be refactor
+        # TODO -> should be refactored
         label_list = example.label
 
         # 2. build validation mask and label mask
@@ -151,16 +155,253 @@ def convert_examples_to_features(
                 else:
                     valid.append(0)
 
-            if len(tokens) >= max_sequence_length - 1:
-                tokens = tokens[0: max_sequence_length - 2]
-                labels = labels[0: max_sequence_length - 2]
-                valid = valid[0: max_sequence_length - 2]
-                label_mask = label_mask[0: max_sequence_length - 2]
+        # make sure the max_sequence_length
+        if len(tokens) >= max_sequence_length - 1:
+            tokens = tokens[0: max_sequence_length - 2]
+            labels = labels[0: max_sequence_length - 2]
+            valid = valid[0: max_sequence_length - 2]
+            label_mask = label_mask[0: max_sequence_length - 2]
 
         n_tokens, segment_ids, label_ids = [], [], []
         n_tokens.append('[CLS]')
-        segment_ids.append(0)
+        segment_ids.insert(0, 0)
         valid.insert(0, 1)
+        # 主要是用来处理 bupt -> bu ##pt 这样数据的结果的。
         label_mask.insert(0, True)
         label_ids.insert(0, label_map['O'])
-        tf.boolean_mask
+
+        # 3. generate label_ids info
+        for i, token in enumerate(tokens):
+            n_tokens.append(token)
+            segment_ids.append(0)
+            label_ids.append(label_map[labels[i]])
+
+        n_tokens.append('[SEP]')
+        segment_ids.append(0)
+        valid.append(1)
+        # sentence end mask
+        label_mask.append(True)
+
+        input_ids = tokenizer.convert_tokens_to_ids(n_tokens)
+        input_mask = [1] * len(input_ids)
+
+        while len(input_ids) < max_sequence_length:
+            input_ids.append(0)
+            input_mask.append(0)
+            segment_ids.append(0)
+            label_ids.append(0)
+
+            # this will remove ##endfix which will influence the result.
+            # this is the key skills to resolve mutli-token problem
+            valid.append(1)
+            label_mask.append(False)
+
+        while len(label_ids) < max_sequence_length:
+            label_ids.append(0)
+            label_mask.append(False)
+
+        assert len(input_ids) == max_sequence_length
+        assert len(input_mask) == max_sequence_length
+
+        assert len(label_ids) == max_sequence_length
+        assert len(label_mask) == max_sequence_length
+
+        assert len(valid) == max_sequence_length
+        assert len(segment_ids) == max_sequence_length
+
+        if index < 5:
+            logger.info('*** Example ***')
+            logger.info(f'guid: {example.guid}')
+            logger.info(f'tokens: {" ".join(n_tokens)}')
+            logger.info(f'input mask: {" ".join([str(mask) for mask in input_mask])}')
+            logger.info(f'segment ids: {" ".join([str(segment_id) for segment_id in segment_ids])}')
+
+        features.append(InputFeature(
+            input_ids=input_ids,
+            input_mask=input_mask,
+            segment_ids=segment_ids,
+            label_ids=label_ids,
+            valid_ids=valid,
+            label_mask=label_mask
+        ))
+    return features
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    # required fields
+    parser.add_argument('--data_dir', default=None, type=str, required=True,
+                        help='the input data dir, should contains the train.txt val.txt, test.txt files')
+    parser.add_argument('--bert_model', default=None, type=str, required=True,
+                        help='bert pretrained model base dir path')
+    parser.add_argument('--output_dir', default='./output', type=str,
+                        help='the output dir which the model checkpoint will be saved at here.')
+
+    # configuration field
+    parser.add_argument('--max_seq_length', default=128, type=int, required=False,
+                        help='max sequence length which is feed into bert model')
+    parser.add_argument('--do_train', default=True, type=bool,
+                        help='whether to train')
+    parser.add_argument('--do_eval', default=True, type=bool,
+                        help='whether to run eval on dev/test data set')
+    parser.add_argument('--train_batch_size', default=32, type=int,
+                        help='total batch size for training')
+    parser.add_argument('--eval_batch_size', default=32, type=int,
+                        help='total batch size for eval')
+    parser.add_argument('--learning_rate', default=5e-3, type=float,
+                        help='the initial learning rate for Adam')
+    parser.add_argument('--warmup_proportion', default=0.1, type=float,
+                        help='proportions of training to perform linear learning rate for train, '
+                             'eg: 0.1 = 10% of training')
+    parser.add_argument('--weight_decay', type=float, default=0.01, help='weight decay if we apply them')
+    parser.add_argument('--seed', type=int, default=42, help='random seed for initialization')
+    parser.add_argument('--multi_gpu', type=bool, default=False,
+                        help='set this flag to enable mult-gpu feature using MirroredStrategy.')
+    parser.add_argument('--gpus', type=str, default='0',
+                        help='list of gpus to use')
+
+    args = argparse.ArgumentParser()
+    process = NerProcessor()
+
+    label_list = process.get_labels()
+    num_labels = len(label_list) + 1
+
+    if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train:
+        raise ValueError('Output directory ({}) already exist and the dir is not empty')
+    if not args.output_dir:
+        os.makedirs(args.output_dir)
+
+    if args.do_train:
+        tokenizer = FullTokenizer(os.path.join(args.model_dir, "vocab.txt"), args.do_lower_case)
+
+    if args.multi_gpu:
+        if len(args.gpu.split(',')) == 1:
+            strategy = tf.distribute.MirroredStrategy()
+        else:
+            # build the gpu device name arr
+            gpus = [f'/gpu:{gpu}' for gpu in args.gpu.split(',')]
+            strategy = tf.distribute.MirroredStrategy(devices=gpus)
+    else:
+        strategy = tf.distribute.OneDeviceStrategy(device=args.gpu)
+
+    if args.do_train:
+        train_examples = process.get_train_examples()
+
+        # optimization total steps -> learning_rate scheduler, weight decay, warmup learning rate
+        num_train_optimization_steps = int(len(train_examples) / args.train_batch_size) * args.num_train_epochs
+
+        warmup_steps = int(args.warmup_proportion * num_train_optimization_steps)
+
+        # keep the final learning should be zero
+        learning_rate_fn = tf.keras.optimizers.schedules.PolynomialDecay(
+            initial_learning_rate=args.learning_rate,
+            decay_steps=num_train_optimization_steps,
+            end_learning_rate=0.
+        )
+
+        if warmup_steps:
+            # layer norm and bias should not weight decay
+            learning_rate_fn = AdamWeightDecay(
+                learning_rate=args.learning_rate,
+                weight_decay_rate=args.weight_decay,
+                beta_1=0.9,
+                beta_2=0.99,
+                epsilon=args.adam_epsilon,
+                exclude_from_weight_decay=['layer_norm', 'bias']
+            )
+
+        with strategy.scope():
+            ner = BertNer(args.model_dir, tf.float32, args.num_labels, args.max_seq_length)
+            # can define the specific meaning of the reduction
+            loss_fct = tf.keras.losses.SparseCategoricalCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
+
+    label_map = {label: index for index, label in enumerate(label_list, 1)}
+
+    if args.do_train:
+        train_features = convert_examples_to_features(
+            train_examples,label_list, args.max_seq_length, tokenizer
+        )
+        logger.info('*** Running training ***')
+        logger.info('  Num Examples = %d', len(train_examples))
+        logger.info('  Batch Size = %d', len(args.train_batch_size))
+        logger.info('  Num Steps = %d', len(num_train_optimization_steps))
+        all_input_ids = tf.data.Dataset.from_tensor_slices(
+            np.asarray([f.input_ids for f in train_features])
+        )
+        all_input_mask = tf.data.Dataset.from_tensor_slices(
+            np.asarray([f.input_mask for f in train_features])
+        )
+
+        all_label_ids = tf.data.Dataset.from_tensor_slices(
+            np.asarray([f.label_ids for f in train_features])
+        )
+        all_label_mask = tf.data.Dataset.from_tensor_slices(
+            np.asarray([f.label_mask for f in train_features])
+        )
+
+        all_valid_ids = tf.data.Dataset.from_tensor_slices(
+            np.asarray([f.valid_ids for f in train_features])
+        )
+        all_segment_ids = tf.data.Dataset.from_tensor_slices(
+            np.asarray([f.segment_ids for f in train_features])
+        )
+
+        train_data = tf.data.Dataset.zip((
+            all_input_ids, all_input_mask, all_segment_ids, all_valid_ids, all_label_ids, all_label_mask
+        ))
+
+        # set the shuffle buffer size, reshuffle the train data in each iteration
+        shuffled_train_data = train_data.shuffle(
+            buffer_size=int(len(train_features) * 0.1),
+            seed=args.seed,
+            reshuffle_each_iteration=True
+        ).batch(args.train_batch_size)
+
+        distributed_data = strategy.experimental_distribute_dataset(shuffled_train_data)
+        loss_metric = tf.keras.metrics.Mean()
+
+        epoch_bar = master_bar(range(1))
+        optimizer: tf.keras.optimizers.Optimizer = None
+
+        def train_steps(input_ids, input_mask, segment_id, valid_ids, label_ids, label_mask):
+            def step_fn(_input_ids, _input_mask, _segment_id, _valid_ids, _label_ids, _label_mask):
+                with tf.GradientTape() as tape:
+                    # _input_ids, one-axis, which will be run on pattern
+                    output = ner(_input_ids, _input_mask, _segment_id, _label_ids, training=True)
+
+                    # flatten all of the outputs
+                    _label_mask = tf.reshape(_label_mask, (-1))
+                    output = tf.reshape(output, (-1, num_labels))
+                    output = tf.boolean_mask(output, _input_mask)
+
+                    _label_ids = tf.reshape(_label_ids, (-1,))
+                    _label_ids = tf.boolean_mask(_label_ids, _label_mask)
+
+                    cross_entropy = loss_fct(_label_ids, output)
+
+                    # this is for single one train data
+                    loss = tf.reduce_sum(cross_entropy) * 1. / args.train_batch_sizes
+
+                gradients = tape.gradient(loss, ner.trainable_variables)
+                optimizer.apply_gradients(grads_and_vars=zip(gradients, ner.trainable_variables))
+
+                return cross_entropy
+            # 在多个gpu上并行跑训练数据
+            per_example_loss = strategy.experimental_run_v2(step_fn, args=(
+                input_ids, input_mask, segment_id, valid_ids, label_ids, label_mask
+            ))
+            mean_loss = strategy.reduce(tf.distribute)
+            return mean_loss
+        pb_max_length = math.ceil(
+            len(train_features) / args.train_batch_size
+        )
+        for epoch in epoch_bar:
+            with strategy.scope():
+                for (input_ids, input_mask, segment_ids, valid_ids, label_ids, label_mask) in progress_bar(distributed_data, total=pb_max_length, parent=epoch_bar):
+                    loss = train_steps(input_ids, input_mask, segment_ids,valid_ids,label_ids,label_mask)
+                    loss_metric(loss)
+                    epoch_bar.child.comment = f'loss: {loss}'
+                loss_metric.reset_states()
+
+        ner.save_weights(os.path.join(args.output_dir, 'model.h5'))
