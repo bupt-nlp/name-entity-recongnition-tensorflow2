@@ -22,6 +22,7 @@ from fastprogress import master_bar, progress_bar
 from bert_ner.model import BertNer
 from bert_ner.optimization import AdamWeightDecay, Warmup
 from bert_ner.tokenization import FullTokenizer
+from bert_ner.config import get_arguments, ModelArguments
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -54,6 +55,7 @@ class InputFeature:
 
 class DataProcessor:
     """base class for different data processors"""
+
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
 
@@ -228,41 +230,8 @@ def convert_examples_to_features(
 
 
 def main():
-    parser = argparse.ArgumentParser()
-
-    # required fields
-    parser.add_argument('--data_dir', default=None, type=str, required=True,
-                        help='the input data dir, should contains the train.txt val.txt, test.txt files')
-    parser.add_argument('--bert_model', default=None, type=str, required=True,
-                        help='bert pretrained model base dir path')
-    parser.add_argument('--output_dir', default='./output', type=str,
-                        help='the output dir which the model checkpoint will be saved at here.')
-
-    # configuration field
-    parser.add_argument('--max_seq_length', default=128, type=int, required=False,
-                        help='max sequence length which is feed into bert model')
-    parser.add_argument('--do_train', default=True, type=bool,
-                        help='whether to train')
-    parser.add_argument('--do_eval', default=True, type=bool,
-                        help='whether to run eval on dev/test data set')
-    parser.add_argument('--train_batch_size', default=32, type=int,
-                        help='total batch size for training')
-    parser.add_argument('--eval_batch_size', default=32, type=int,
-                        help='total batch size for eval')
-    parser.add_argument('--learning_rate', default=5e-3, type=float,
-                        help='the initial learning rate for Adam')
-    parser.add_argument('--warmup_proportion', default=0.1, type=float,
-                        help='proportions of training to perform linear learning rate for train, '
-                             'eg: 0.1 = 10% of training')
-    parser.add_argument('--weight_decay', type=float, default=0.01, help='weight decay if we apply them')
-    parser.add_argument('--seed', type=int, default=42, help='random seed for initialization')
-    parser.add_argument('--multi_gpu', type=bool, default=False,
-                        help='set this flag to enable mult-gpu feature using MirroredStrategy.')
-    parser.add_argument('--gpus', type=str, default='0',
-                        help='list of gpus to use')
-
-    args = argparse.ArgumentParser()
-    process = NerProcessor()
+    args: ModelArguments = get_arguments()
+    process = NerProcessor(args.data_dir)
 
     label_list = process.get_labels()
     num_labels = len(label_list) + 1
@@ -273,7 +242,7 @@ def main():
         os.makedirs(args.output_dir)
 
     if args.do_train:
-        tokenizer = FullTokenizer(os.path.join(args.model_dir, "vocab.txt"), args.do_lower_case)
+        tokenizer = FullTokenizer(os.path.join(args.bert_model, "vocab.txt"), args.do_lower_case)
 
     if args.multi_gpu:
         if len(args.gpu.split(',')) == 1:
@@ -312,7 +281,7 @@ def main():
             )
 
         with strategy.scope():
-            ner = BertNer(args.model_dir, tf.float32, args.num_labels, args.max_seq_length)
+            ner = BertNer(args.bert_model, tf.float32, args.num_labels, args.max_seq_length)
             # can define the specific meaning of the reduction
             loss_fct = tf.keras.losses.SparseCategoricalCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
 
@@ -320,7 +289,7 @@ def main():
 
     if args.do_train:
         train_features = convert_examples_to_features(
-            train_examples,label_list, args.max_seq_length, tokenizer
+            train_examples, label_list, args.max_seq_length, tokenizer
         )
         logger.info('*** Running training ***')
         logger.info('  Num Examples = %d', len(train_examples))
@@ -381,27 +350,106 @@ def main():
                     cross_entropy = loss_fct(_label_ids, output)
 
                     # this is for single one train data
-                    loss = tf.reduce_sum(cross_entropy) * 1. / args.train_batch_sizes
+                    loss = tf.reduce_sum(cross_entropy) * 1. / args.train_batch_size
 
                 gradients = tape.gradient(loss, ner.trainable_variables)
                 optimizer.apply_gradients(grads_and_vars=zip(gradients, ner.trainable_variables))
 
                 return cross_entropy
+
             # 在多个gpu上并行跑训练数据
             per_example_loss = strategy.experimental_run_v2(step_fn, args=(
                 input_ids, input_mask, segment_id, valid_ids, label_ids, label_mask
             ))
             mean_loss = strategy.reduce(tf.distribute)
             return mean_loss
+
         pb_max_length = math.ceil(
             len(train_features) / args.train_batch_size
         )
         for epoch in epoch_bar:
             with strategy.scope():
-                for (input_ids, input_mask, segment_ids, valid_ids, label_ids, label_mask) in progress_bar(distributed_data, total=pb_max_length, parent=epoch_bar):
-                    loss = train_steps(input_ids, input_mask, segment_ids,valid_ids,label_ids,label_mask)
+                for (input_ids, input_mask, segment_ids, valid_ids, label_ids, label_mask) in progress_bar(
+                        distributed_data, total=pb_max_length, parent=epoch_bar):
+                    loss = train_steps(input_ids, input_mask, segment_ids, valid_ids, label_ids, label_mask)
                     loss_metric(loss)
                     epoch_bar.child.comment = f'loss: {loss}'
                 loss_metric.reset_states()
 
         ner.save_weights(os.path.join(args.output_dir, 'model.h5'))
+
+    if args.do_eval:
+        tokenizer = FullTokenizer(os.path.join(args.bert_model, 'vocab.txt'), do_lower_case=args.do_lower_case)
+        ner = BertNer(args.bert_model, tf.float32, args.num_labels, args.max_seq_length)
+
+        # create example eval data to build the model
+        ids = tf.ones((1, 128), dtype=tf.float32)
+        ner(ids, ids, ids, ids, ids, training=False)
+        ner.load_weights(os.path.join(args.output_dir, 'model.h5'))
+
+        # load the data
+        if args.eval_on == 'dev':
+            eval_examples = process.get_dev_examples()
+        elif args.eval_on == 'test':
+            eval_examples = process.get_test_examples()
+        else:
+            raise KeyError(f'eval_on arguments is expected in [dev, test]')
+
+        eval_features = convert_examples_to_features(
+            eval_examples, label_list, args.max_seq_length, tokenizer
+        )
+
+        # print the eval info
+        logger.info('*** Eval Examples ***')
+        logger.info('  Num Examples = %d', len(eval_features))
+        logger.info('  Batch Size = %d', args.eval_batch_size)
+
+        all_input_ids = tf.data.Dataset.from_tensor_slices(
+            [f.input_ids for f in eval_features]
+        )
+        all_input_mask = tf.data.Dataset.from_tensor_slices(
+            [f.input_mask for f in eval_features]
+        )
+        all_segment_ids = tf.data.Dataset.from_tensor_slices(
+            [f.segment_ids for f in eval_features]
+        )
+        all_valid_ids = tf.data.Dataset.from_tensor_slices(
+            [f.valid_ids for f in eval_features]
+        )
+        all_label_ids = tf.data.Dataset.from_tensor_slices(
+            [f.label_ids for f in eval_features]
+        )
+        all_label_mask = tf.data.Dataset.from_tensor_slices(
+            [f.label_mask for f in eval_features]
+        )
+
+        eval_data = tf.data.Dataset.zip((
+            all_input_ids, all_input_mask, all_segment_ids, all_valid_ids, all_label_ids, all_label_mask
+        )).batch(args.eval_batch_size)
+
+        loss_metric = tf.metrics.Mean()
+        epoch_bar = master_bar(range(1))
+        processor_bar_length = math.ceil(
+            len(eval_features) / args.eval_batch_size
+        )
+        y_true, y_predict = [], []
+        for epoch in epoch_bar:
+            for (input_ids, input_mask, segment_ids, valid_ids, label_ids, label_mask) in progress_bar(eval_data,
+                                                                                                       total=processor_bar_length,
+                                                                                                       parent=epoch_bar):
+                logits = ner(input_ids, input_mask, segment_ids, valid_ids, training=False)
+                logits = tf.argmax(logits, axis=-1)
+                label_predict = tf.boolean_mask(logits, label_mask)
+                y_true.append(label_ids)
+                y_predict.append(label_predict)
+
+        report = classification_report(y_true, y_predict, digits=4)
+        output_eval_file = os.path.join(args.output_dir, 'eval_result.txt')
+        with open(output_eval_file, 'w', encoding='utf-8') as f:
+            logger.info('*** Eval Result ***')
+            logger.info(report)
+            f.write(report)
+
+
+if __name__ == '__main__':
+    main()
